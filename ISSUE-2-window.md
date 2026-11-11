@@ -55,9 +55,21 @@ hyprctl clients -j | python3 -c "import json,sys;[print({k:c.get(k) for k in ('t
 
 ### 现有绕过
 
-- 托盘图标 →「退出」（菜单项：`显示闪电说` / `退出`，DBus 层面 id 2 / id 3，实测可用）；
-- `systemctl --user stop app-shandianshuo@autostart.service`；
-- 仓库里的 `shandianshuo-quit.sh`（同时处理下面第 2 个问题）。
+用户侧可以用一个 `LD_PRELOAD` 垫片把 `gtk_window_iconify()` 换成 `gtk_widget_hide()`，
+这样关闭就是“隐藏窗口、后台常驻”（符合原意），实测有效：
+
+```bash
+gcc -O2 -fPIC -shared -o ~/.local/lib/shandianshuo/libshandianshuo-hide-on-minimize.so \
+    shandianshuo-hide-on-minimize.c
+# 然后把上面这个 .so 加进启动 AppImage 的 LD_PRELOAD
+```
+
+垫片验证（独立 GTK 小程序）：无 shim `visible=1`，有 shim `visible=0`。
+应用到隐藏后的状态：`hyprctl clients` 中不再有该窗口、进程仍在、托盘项仍在、录音/上屏正常。
+叫回窗口：再启动一次（单实例激活 → `deiconify + present_with_time`）或托盘「显示闪电说」。
+
+需要真正退出时：托盘「退出」，或 `systemctl --user stop app-shandianshuo@autostart.service`
+（还需处理下面第 2 个问题里的残留 `xclip`）。
 
 ---
 

@@ -11,7 +11,7 @@
 | 1 | 「检查麦克风」/ device-error 通知 | v0.7.7 自动选设备时会直接打开 ALSA 硬件节点 `front:CARD=...,DEV=0`，而该 PCM 已被 PipeWire 独占 → `EBUSY` | `config.json` 里 `"audio_device": "default"` |
 | 2 | 「未检测到音频输入设备」 | AppImage 内打包了旧版 `libpipewire-0.3.so.0`，遮蔽系统库 → `libasound_module_pcm_pipewire.so` 加载失败 → `snd_pcm_open("default")` 返回 `ENXIO` | 启动器里 `LD_PRELOAD` 系统 libpipewire |
 | 3 | 转写成功但「操作未完成：自动粘贴失败」 | 目标被判为 X11 → 只用 `xclip`，系统未安装；不会回退到已存在的 `wl-copy` | `sudo pacman -S xclip`，然后重启应用 |
-| 4 | 点「关闭」窗口关不掉，纹丝不动 | 关闭走 `window.minimize()`（最小化到托盘），Hyprland/Sway 对 Xwayland 窗口的最小化请求不生效 → 无反应 | 托盘图标 →「退出」；或 `systemctl --user stop app-shandianshuo@autostart.service` |
+| 4 | 点「关闭」窗口关不掉，纹丝不动 | 关闭走 `window.minimize()`（最小化到托盘），Hyprland/Sway 对 Xwayland 窗口的最小化请求不生效 → 无反应 | 用 LD_PRELOAD 垫片把 `gtk_window_iconify` 换成 `gtk_widget_hide`，关闭即隐藏、后台常驻 |
 | 5 | 退出后仍显示「运行中」，无法重新启动/判断状态 | 粘贴时 fork 的 `xclip -selection clipboard` 常驻服务剪贴板，而自动启动单元是 `ExitType=cgroup` → 单元永远停在 active | 清掉残留 `xclip`；用仓库里的 `shandianshuo-quit.sh` |
 
 ---
@@ -24,6 +24,7 @@
 | `FEEDBACK.md` | 一屏版反馈稿，用于应用内「常见问题/反馈」 |
 | `shandianshuo-launcher.sh` | 可直接安装的启动器 |
 | `shandianshuo-quit.sh` | 彻底退出（含清理残留 `xclip`） |
+| `shandianshuo-hide-on-minimize.c` | 让「关闭」真正隐藏窗口（minimize → hide）的 LD_PRELOAD 垫片 |
 | `ISSUE-2-window.md` | 问题 4/5 的上游 issue 正文 |
 
 ## 环境（复现基线）
@@ -263,31 +264,76 @@ hyprctl clients -j | python3 -c "import json,sys;[print({k:c.get(k) for k in ('t
 于是“最小化”在本机等于空操作：窗口不隐藏，也无法关闭。应用自己的「最小化」按钮同理无效。
 （GNOME/KDE 上同样动作是有效的，所以这个 bug 只在 Hyprland/Sway/Niri 这类无最小化语义的合成器上暴露。）
 
-### 修法（用户侧）
+### 修法（用户侧）：把 minimize 换成 hide
 
-1. 托盘图标（顶部栏右侧）→「退出」。菜单项在 DBus 层面是 `显示闪电说` / `退出`，实测可用：
+它的本意就是“关闭 = 收进托盘、后台常驻”（全局快捷键还要用），所以不要退出应用，
+而是让「关闭」真正**隐藏窗口**。做法：用 `LD_PRELOAD` 覆盖 `gtk_window_iconify()`，
+改为 `gtk_widget_hide()`。
+
+源码 `shandianshuo-hide-on-minimize.c`，编译安装：
 
 ```bash
-# 查看托盘菜单项（可选）
+mkdir -p ~/.local/lib/shandianshuo
+gcc -O2 -fPIC -shared -o ~/.local/lib/shandianshuo/libshandianshuo-hide-on-minimize.so \
+    shandianshuo-hide-on-minimize.c
+```
+
+再接进启动器（追加到已有的 `LD_PRELOAD` 列表，见 `shandianshuo-launcher.sh`）：
+
+```bash
+LD_PRELOAD=/usr/lib/libpipewire-0.3.so.0:/usr/lib/libwayland-client.so.0:$HOME/.local/lib/shandianshuo/libshandianshuo-hide-on-minimize.so
+```
+
+垫片本身可以脱离应用单独验证（写个 200ms 后调 `gtk_window_iconify` 的 GTK 小程序）：
+
+```
+无 shim：after iconify → visible=1   （真 iconify，窗口不会隐藏）
+有 shim：after iconify → visible=0   （变成 hide）
+```
+
+实测效果（点击「关闭」后）：
+
+```bash
+hyprctl clients -j | grep -c Shandianshuo   # 0：窗口从合成器里消失（不是最小化）
+pgrep -f 'shandianshuo --autostart'         # 仍在：后台常驻
+busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+  org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems | grep -c ayatana   # 1：托盘仍在
+```
+
+隐藏后录音链路完全正常：
+
+```
+INFO [Audio] Recording with: Default ALSA Output (currently PipeWire Media Server), 44100Hz, 2 channels
+INFO [Inject] Success: *** (54 chars)
+INFO [Transcription] Finalized voice input record … as success
+```
+
+### 窗口隐藏后怎么叫回来
+
+1. **再点一次启动器图标/命令** —— 走单实例激活：
+
+```
+INFO [Single Instance] Another instance attempted to start
+INFO [Window] single-instance activation called gtk deiconify() and present_with_time()
+```
+
+2. 托盘图标（顶部栏右侧托盘区）→「显示闪电说」。菜单项 DBus 层面是 `显示闪电说` / `退出`：
+
+```bash
 M=/org/ayatana/NotificationItem/tray_icon_tray_app_main/Menu
 busctl --user call :1.220 $M com.canonical.dbusmenu GetLayout iias 0 -- -1 0
 # id 2 = 显示闪电说，id 3 = 退出
 ```
 
-2. 命令行退出：
+### 真想退出时
 
-```bash
-systemctl --user stop app-shandianshuo@autostart.service
-```
-
-3. 干净退出（推荐，连残留进程一起清）：使用仓库里的 `shandianshuo-quit.sh`
+1. 托盘 →「退出」；
+2. 或 `shandianshuo-quit`（已验证，会连带清掉问题 5 里那个残留 `xclip`）。
 
 ```bash
 install -Dm755 shandianshuo-quit.sh ~/.local/bin/shandianshuo-quit
 shandianshuo-quit
 ```
-
-> 想绑快捷键/桌面菜单的话，直接调这个脚本即可。
 
 ---
 
