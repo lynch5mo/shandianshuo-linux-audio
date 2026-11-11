@@ -3,13 +3,16 @@
 适用于：AppImage 版闪电说在 **PipeWire** 桌面（Arch/Omarchy、Fedora、Ubuntu 22.04+ 等都一样）上，
 按快捷键录音时提示「检查麦克风」「未检测到音频输入设备」，或转写成功但无法上屏。
 
-三个问题可以独立出现，也可以像我这样叠在一起。每个问题都有：现象 → 复现 → 根因 → 修法。
+问题可以独立出现，也可以像我这样叠在一起。每个问题都有：现象 → 复现 → 根因 → 修法。
+前三个是「录音/上屏」链路，后两个是窗口与进程生命周期。
 
 | # | 现象 | 根因 | 修法 |
 |---|---|---|---|
 | 1 | 「检查麦克风」/ device-error 通知 | v0.7.7 自动选设备时会直接打开 ALSA 硬件节点 `front:CARD=...,DEV=0`，而该 PCM 已被 PipeWire 独占 → `EBUSY` | `config.json` 里 `"audio_device": "default"` |
 | 2 | 「未检测到音频输入设备」 | AppImage 内打包了旧版 `libpipewire-0.3.so.0`，遮蔽系统库 → `libasound_module_pcm_pipewire.so` 加载失败 → `snd_pcm_open("default")` 返回 `ENXIO` | 启动器里 `LD_PRELOAD` 系统 libpipewire |
 | 3 | 转写成功但「操作未完成：自动粘贴失败」 | 目标被判为 X11 → 只用 `xclip`，系统未安装；不会回退到已存在的 `wl-copy` | `sudo pacman -S xclip`，然后重启应用 |
+| 4 | 点「关闭」窗口关不掉，纹丝不动 | 关闭走 `window.minimize()`（最小化到托盘），Hyprland/Sway 对 Xwayland 窗口的最小化请求不生效 → 无反应 | 托盘图标 →「退出」；或 `systemctl --user stop app-shandianshuo@autostart.service` |
+| 5 | 退出后仍显示「运行中」，无法重新启动/判断状态 | 粘贴时 fork 的 `xclip -selection clipboard` 常驻服务剪贴板，而自动启动单元是 `ExitType=cgroup` → 单元永远停在 active | 清掉残留 `xclip`；用仓库里的 `shandianshuo-quit.sh` |
 
 ---
 
@@ -17,9 +20,11 @@
 
 | 文件 | 用途 |
 |---|---|
-| `ISSUE.md` | 上游 issue 正文（含最小复现、根因、修复建议） |
+| `ISSUE.md` | 上游 issue 正文（录音链路，含最小复现、根因、修复建议） |
 | `FEEDBACK.md` | 一屏版反馈稿，用于应用内「常见问题/反馈」 |
 | `shandianshuo-launcher.sh` | 可直接安装的启动器 |
+| `shandianshuo-quit.sh` | 彻底退出（含清理残留 `xclip`） |
+| `ISSUE-2-window.md` | 问题 4/5 的上游 issue 正文 |
 
 ## 环境（复现基线）
 
@@ -225,6 +230,105 @@ sudo pacman -S --needed xclip        # Debian/Ubuntu: sudo apt install xclip
 
 ---
 
+## 问题 4：关闭按钮无效（minimize 在 Hyprland 上是空操作）
+
+### 现象
+
+点标题栏右上的「关闭」，窗口纹丝不动，既不关也不隐藏。点两次就是下面两行日志：
+
+```
+INFO Main window minimized on Linux tray fallback
+INFO Main window minimized on Linux tray fallback
+```
+
+### 证据
+
+窗口仍然是 mapped（在屏幕上）：
+
+```bash
+hyprctl clients -j | python3 -c "import json,sys;[print({k:c.get(k) for k in ('title','mapped','hidden','workspace')}) for c in json.load(sys.stdin) if c.get('class')=='Shandianshuo']"
+# {'title': '闪电说', 'mapped': True, 'hidden': False, 'workspace': {'id': 1, 'name': '1'}}
+```
+
+### 根因
+
+关闭请求的实现是「最小化到托盘」（日志里明确写了 `Linux tray fallback`），而不是
+隐藏窗口（`set_visible(false)`）或退出。
+
+- Hyprland 只对**原生 Wayland** 客户端实现了最小化（`CXWaylandSurface::setMinimized`，即
+  `xdg_toplevel.set_minimized`）；
+- 对 **Xwayland** 窗口的 X11 `IconicState` 请求不做处理；
+- 而闪电说因为录音浮窗定位需要 `GDK_BACKEND=x11`，必然跑在 Xwayland 上。
+
+于是“最小化”在本机等于空操作：窗口不隐藏，也无法关闭。应用自己的「最小化」按钮同理无效。
+（GNOME/KDE 上同样动作是有效的，所以这个 bug 只在 Hyprland/Sway/Niri 这类无最小化语义的合成器上暴露。）
+
+### 修法（用户侧）
+
+1. 托盘图标（顶部栏右侧）→「退出」。菜单项在 DBus 层面是 `显示闪电说` / `退出`，实测可用：
+
+```bash
+# 查看托盘菜单项（可选）
+M=/org/ayatana/NotificationItem/tray_icon_tray_app_main/Menu
+busctl --user call :1.220 $M com.canonical.dbusmenu GetLayout iias 0 -- -1 0
+# id 2 = 显示闪电说，id 3 = 退出
+```
+
+2. 命令行退出：
+
+```bash
+systemctl --user stop app-shandianshuo@autostart.service
+```
+
+3. 干净退出（推荐，连残留进程一起清）：使用仓库里的 `shandianshuo-quit.sh`
+
+```bash
+install -Dm755 shandianshuo-quit.sh ~/.local/bin/shandianshuo-quit
+shandianshuo-quit
+```
+
+> 想绑快捷键/桌面菜单的话，直接调这个脚本即可。
+
+---
+
+## 问题 5：退出后「还在运行」——残留 xclip 让自动启动单元卡在 active
+
+### 现象
+
+托盘「退出」后应用确实消失了，但 `systemctl --user is-active` 仍然是 `active`，于是看起来
+“应用还在运行”，而 unit 状态与实际不符。
+
+```bash
+systemctl --user is-active app-shandianshuo@autostart.service    # active（其实已经没有主进程）
+systemctl --user status app-shandianshuo@autostart.service        # Process: … (code=exited, status=0/SUCCESS)
+```
+
+### 复现 / 根因
+
+```bash
+cg=$(systemctl --user show -p ControlGroup --value app-shandianshuo@autostart.service)
+for p in $(cat /sys/fs/cgroup$cg/cgroup.procs); do ps -o pid,cmd -p $p --no-headers; done
+# 136102 xclip -selection clipboard -target UTF8_STRING
+```
+
+- 上屏前它会用 `xclip -selection clipboard ...` 写剪贴板；`xclip` 写完会 fork 常驻以提供 selection
+  （这是 xclip 的正常行为，不是 bug）；
+- 这个 fork 出来的 `xclip` 落在应用的 cgroup 里；
+- `~/.config/autostart/*.desktop` 被 systemd-xdg-autostart-generator 转成
+  `app-…@autostart.service`，带 `ExitType=cgroup`：只要 cgroup 里还有**任何**进程，单元就保持 active。
+
+### 修法
+
+用 `shandianshuo-quit.sh`：先记录 cgroup 内的 pid，`systemctl --user stop` 之后再兜底 kill 残留。
+或者手动：
+
+```bash
+systemctl --user stop app-shandianshuo@autostart.service
+pgrep -f 'xclip -selection clipboard' | xargs -r kill
+```
+
+---
+
 ## 完整验证
 
 ```bash
@@ -259,6 +363,13 @@ tail -40 ~/.config/shandianshuo/logs/shandianshuo.$(date +%F).log | grep -vE "Ov
 5. **报错文案区分原因**：`EBUSY`（设备被占用）与 `ENXIO`（插件/设备不可用）应给出不同提示，
    并在日志里打印 alsa-lib 的 `snd_strerror()`，否则用户只能看到「检查麦克风」。
 6. 工具链探测结果建议不要永久缓存，或在 `PATH` 变化后重新探测（用户装完 `xclip` 必须重启应用这点很反直觉）。
+7. **关闭策略不要用 minimize**：Linux（尤其 Hyprland/Sway/Niri）没有最小化语义。应当
+   - 有托盘 → `window.hide()` / `set_visible(false)`；
+   - 无托盘 → 直接退出；
+   - 若仍调 `minimize()`，请至少回读 `is_minimized()`，失败则退回 `hide()`，不要假设“已最小化”。
+8. **外部命令不要留在进程树里**：`xclip` 用 `-l 1`（或 `-loops 1`）并在写完后等它退出，
+   或改用应用内剪贴板实现。否则配合 systemd 的 `ExitType=cgroup`，会让自动启动单元永远停在
+   `active`，也让用户无法通过 `systemctl` 判断应用是否真的在跑。
 
 ---
 
@@ -272,4 +383,8 @@ tail -40 ~/.config/shandianshuo/logs/shandianshuo.$(date +%F).log | grep -vE "Ov
       └─ 不能：检查 libpipewire 遮蔽（本文件问题 2）
 转写成功但不上屏
   → 装 xclip，重启应用
+点「关闭」没反应
+  → 正常现象（close=最小化，Hyprland 无最小化）→ 托盘「退出」或 shandianshuo-quit
+退出后 systemctl 仍显示 active
+  → 残留 xclip 占着 cgroup → shandianshuo-quit
 ```
